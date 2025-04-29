@@ -1,0 +1,321 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import fitz  # PyMuPDF
+import unicodedata
+import os
+import re
+import json
+import random
+from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.corpus import wordnet
+from transformers import pipeline
+from collections import Counter
+import unicodedata
+import nltk
+from transformers import T5Tokenizer
+import unicodedata
+from unidecode import unidecode 
+
+
+app = Flask(__name__)
+CORS(app)
+
+T5_MODEL_NAME = "valhalla/t5-base-qg-hl"
+t5_tokenizer = T5Tokenizer.from_pretrained(T5_MODEL_NAME)
+t5_pipeline = pipeline("text2text-generation", model=T5_MODEL_NAME)
+
+ROBERTA_MODEL_NAME = "deepset/roberta-base-squad2"
+roberta_pipeline = pipeline("question-answering", model=ROBERTA_MODEL_NAME)
+
+def extract_text_from_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    return "\n".join([page.get_text("text") for page in doc])
+
+
+def clean_text(text):
+    """
+    Advanced text cleaning with multiple normalization steps
+    Returns ASCII-only text with proper spacing and formatting
+    """
+    # Step 1: Normalize Unicode characters
+    text = unicodedata.normalize('NFKD', text)
+    
+    # Step 2: Transliterate to ASCII using unidecode
+    text = unidecode(text)
+    
+    # Step 3: Remove remaining non-ASCII characters
+    text = text.encode('ascii', 'ignore').decode('ascii')
+    
+    # Step 4: Clean up formatting and spacing
+    text = re.sub(r'\s+', ' ', text)  # Collapse whitespace
+    text = re.sub(r'[^\w\s.,?!-]', ' ', text)  # Remove special chars
+    text = re.sub(r'\b\d+\.?\b', ' ', text)  # Remove standalone numbers
+    
+    # Step 5: Final cleanup
+    text = ' '.join(text.strip().split())
+    return text
+
+def validate_answer(answer, context):
+    """Ensure answers are meaningful and properly formatted"""
+    # Basic length check
+    if len(answer) < 2 or len(answer.split()) > 5:
+        return False
+    
+    # Common invalid patterns
+    invalid_patterns = [
+        r'^\d+$',  # Only numbers
+        r'^[^a-zA-Z0-9]+$',  # No alphanumerics
+        r'\b(page|chapter|section)\b',  # Document references
+        r'\b(fig|table)\b\.?\d*',  # Figure/table references
+    ]
+    
+    for pattern in invalid_patterns:
+        if re.search(pattern, answer, re.IGNORECASE):
+            return False
+    
+    # Should appear in context as whole word
+    if not re.search(r'\b' + re.escape(answer) + r'\b', context, re.IGNORECASE):
+        return False
+    
+    return True
+
+def get_answer_context(text, answer, start=None, end=None):
+    # First try to find answer in sentences
+    sentences = sent_tokenize(text)
+    for i, sent in enumerate(sentences):
+        if answer in sent:
+            context_start = max(0, i-1)
+            context_end = min(len(sentences), i+2)
+            return ' '.join(sentences[context_start:context_end])
+    
+    # Fallback to position-based context
+    window = 200
+    if start is not None and end is not None:
+        start = max(0, start - window)
+        end = min(len(text), end + window)
+        return text[start:end]
+    
+    # Final fallback: return first 400 characters
+    return text[:400]
+
+def generate_distractors(answer, context, question):
+    answer = answer.lower().strip()
+    candidates = []
+    
+    # 1. Get synonyms from WordNet
+    synonyms = set()
+    for syn in wordnet.synsets(answer):
+        for lemma in syn.lemmas():
+            synonym = lemma.name().replace("_", " ").lower()
+            if synonym != answer and len(synonym.split()) == 1:
+                synonyms.add(synonym.title())
+    candidates += list(synonyms)[:3]
+
+    # 2. Extract important words from question + context
+    combined_text = f"{question} {context}"
+    words = word_tokenize(combined_text)
+    pos_tags = nltk.pos_tag(words)
+    
+    # Get relevant nouns/verbs from context+question
+    context_words = [
+        word.title() for word, pos in pos_tags
+        if pos.startswith(('N', 'V'))  # Nouns or verbs
+        and word.lower() != answer
+        and len(word) > 3  # Ignore short words
+    ]
+    
+    # Add most frequent context words
+    word_freq = Counter(context_words)
+    candidates += [word for word, _ in word_freq.most_common(5)]
+
+    # 3. Final fallback with question-based placeholders
+    if len(candidates) < 3:
+        candidates += [f"Option {chr(65+i)}" for i in range(3)]
+    
+    # Ensure uniqueness and proper length
+    candidates = list(set(candidates))
+    random.shuffle(candidates)
+    filtered = [
+        opt for opt in candidates
+        if validate_answer(opt, context + ' ' + question)
+        and opt.lower() != answer.lower()
+    ]
+    return filtered[:3] if len(filtered) >=3 else ["Option A", "Option B", "Option C"]
+
+def generate_questions(text, num_questions, max_tokens=512, overlap=50):
+    """
+    Generate questions using the T5 model.
+    """
+    tokens = t5_tokenizer.encode(text, add_special_tokens=False)
+    questions = []
+    start = 0  # Start index for chunking
+    
+    # Calculate the effective chunk size (accounting for special tokens)
+    effective_max_tokens = max_tokens - t5_tokenizer.num_special_tokens_to_add()
+    
+    # Keep processing chunks until we have enough questions
+    while start < len(tokens) and len(questions) < num_questions:
+        # Get a chunk of tokens
+        end = start + effective_max_tokens
+        chunk = tokens[start:end]
+        
+        # Decode the chunk back to text
+        chunk_text = t5_tokenizer.decode(chunk, skip_special_tokens=True)
+        
+        # Re-encode the chunk WITH special tokens to check for overflow
+        encoded_with_special = t5_tokenizer.encode(
+            chunk_text,
+            add_special_tokens=True,
+            max_length=max_tokens,  # Enforce hard truncation
+            truncation=True
+        )
+        
+        # If the chunk is valid (within token limit), generate questions
+        if len(encoded_with_special) <= max_tokens:
+            results = t5_pipeline(chunk_text, max_length=max_tokens, truncation=True)
+            questions.extend([q["generated_text"] for q in results])
+        
+        # Move to the next chunk with overlap
+        start = end - overlap
+
+    if len(questions) == 0:
+        return None
+    else:
+        return questions[:min(len(questions),num_questions)]
+
+def generate_quiz(text, num_questions):
+    text = clean_text(text)
+    if not text:
+        return 0, []
+    
+    # First generate all questions
+    questions = generate_questions(text, 2*num_questions)
+    if not questions:
+        return 0, []
+    
+    quiz_data = []
+    used_answers = set()
+    
+    # Now process answers and options
+    for question in questions:
+        try:
+            # Answer extraction
+            qa_result = roberta_pipeline(question=question, context=text)
+            answer = qa_result['answer'].strip()
+            
+            # Validate answer
+            if (not answer or 
+                len(answer) < 2 or 
+                answer.lower() in used_answers or 
+                answer.lower() not in text.lower()):
+                continue
+                
+            # Get context for distractor generation
+            answer_context = get_answer_context(
+                text, 
+                answer,
+                qa_result.get('start'),
+                qa_result.get('end')
+            )
+            
+            # Generate options
+            distractors = generate_distractors(answer, answer_context, question)
+            options = [answer.title()] + distractors
+            random.shuffle(options)
+            
+            quiz_data.append({
+                "question": question,
+                "options": options,
+                "answer": answer.title()
+            })
+            used_answers.add(answer.lower())
+            
+            if len(quiz_data) >= num_questions:
+                break
+                
+        except Exception as e:
+            print(f"Error processing question: {e}")
+    
+    # Save results (existing code remains same)
+    try:
+        with open("Quizzes.json", "w") as f:
+            json.dump(quiz_data, f, indent=2)
+    except Exception as e:
+        print(f"Error saving quiz: {e}")
+        return -1, []
+
+    return len(quiz_data), quiz_data
+
+@app.route('/api/quiz', methods=['POST'])
+def handle_quiz():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+    
+    file = request.files['file']
+    num_questions = int(request.form.get('numberOfQuestions', 5))
+    
+    try:
+        temp_path = "temp.pdf"
+        file.save(temp_path)
+        text = extract_text_from_pdf(temp_path)
+        if not text: 
+            return jsonify({'error': 'Empty PDF'}), 400
+        
+        result_status, quiz_data = generate_quiz(text, num_questions)
+        
+        if result_status == -1:
+            return jsonify({"quiz": "Quiz generation failed - unable to save results"}), 500
+        elif result_status == 0:
+            return jsonify({"quiz": "No questions could be generated", "questions": []}), 200
+        elif result_status < num_questions:
+            return jsonify({
+                "quiz": f"Partial success ({result_status}/{num_questions} questions generated)",
+                "status": "partial_success",
+                "questions": quiz_data
+            }), 200
+        else:
+            return jsonify({
+                "quiz": f"Successfully generated {num_questions} questions",
+                "status": "complete_success",
+                "questions": quiz_data
+            }), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if os.path.exists("temp.pdf"):
+            os.remove("temp.pdf")
+
+@app.route('/api/questions', methods=['POST'])
+def generate_questions_endpoint():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+
+    file = request.files['file']
+    num_questions = int(request.form.get('numberOfQuestions', 10))
+
+    pdf_path = "temp.pdf"
+    try:
+        file.save(pdf_path)
+        document_text = extract_text_from_pdf(pdf_path)
+
+        if not document_text:
+            return jsonify({'error': 'No text extracted from PDF'}), 400
+
+        generated_data = generate_questions(document_text, num_questions)
+
+        if not generated_data:
+            return jsonify({'error': 'Failed to generate questions'}), 500
+
+        return jsonify({"questions": generated_data})
+
+    except Exception as e:
+        print(f"Server Error: {e}")
+        return jsonify({'error': 'Internal Server Error'}), 500
+    finally:
+        if os.path.exists(pdf_path):
+            os.remove(pdf_path)
+
+
+if __name__ == '__main__':
+    app.run(debug=True)

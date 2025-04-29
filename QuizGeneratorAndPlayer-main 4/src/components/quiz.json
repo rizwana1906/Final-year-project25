@@ -1,0 +1,52 @@
+[
+  {
+    "question": "What is the name of the book that was written by Manoj Kukreja?",
+    "options": [
+      "Book",
+      "Foreword",
+      "Manoj",
+      "Data"
+    ],
+    "answer": "Foreword"
+  },
+  {
+    "question": "What is the main topic of the book?",
+    "options": [
+      "Engineering",
+      "Pipeline",
+      "Summary",
+      "Architecting The Electroniz Data Lake"
+    ],
+    "answer": "Architecting The Electroniz Data Lake"
+  },
+  {
+    "question": "What is the data collection stage of the Silver Layer?",
+    "options": [
+      "Storage",
+      "Developing Running",
+      "Data",
+      "Layer"
+    ],
+    "answer": "Developing Running"
+  },
+  {
+    "question": "What is the book for?",
+    "options": [
+      "Data",
+      "Pipeline",
+      "The Story Of Data Engineering And Analytics",
+      "Azure"
+    ],
+    "answer": "The Story Of Data Engineering And Analytics"
+  },
+  {
+    "question": "What is the main focus of the chapter?",
+    "options": [
+      "Discovering Storage And Compute Data Lake Architectures",
+      "Data",
+      "Storage",
+      "Introduces"
+    ],
+    "answer": "Discovering Storage And Compute Data Lake Architectures"
+  }
+]
